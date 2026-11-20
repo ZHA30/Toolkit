@@ -25,10 +25,14 @@
   const MARK = 'data-bilingual';
   // Default full-page DOM rules adapted from Read Frog (GPL-3.0).
   // https://github.com/mengxi-ream/read-frog/tree/main/src/utils/host
-  const SKIP = `head,title,hr,input,textarea,img,video,audio,canvas,source,track,meta,script,noscript,style,link,rt,rp,pre,svg,math,[${MARK}],.sr-only,.visually-hidden,[hidden="until-found" i]`;
-  const FORCE_BLOCK = 'body,h1,h2,h3,h4,h5,h6,br,form,select,button,label,ul,ol,li,blockquote,pre,article,section,figure,figcaption,header,footer,main,nav';
+  const HEADINGS = 'h1,h2,h3,h4,h5,h6';
+  const NAVIGATION = 'nav,[role="navigation"]';
+  const HEADER_NAVIGATION = `:is(header,[role="banner"]) :is(${NAVIGATION}),nav[role="banner"]`;
+  const SKIP = `head,title,hr,input,textarea,img,video,audio,canvas,source,track,meta,script,noscript,style,link,rt,rp,pre,svg,math,[${MARK}],.sr-only,.visually-hidden,[hidden="until-found" i],${HEADER_NAVIGATION}`;
+  const FORCE_BLOCK = `body,${HEADINGS},br,form,select,button,label,ul,ol,li,blockquote,pre,article,section,figure,figcaption,header,footer,main,nav`;
   const FORCE_INLINE_TRANSLATION = 'a,button,select,option,span';
   const ATOMIC_CONTROL = 'a,button,summary,[role="link"],[role="button"],[role="menuitem"],[role="tab"],[aria-expanded][aria-controls],code,kbd,ruby,sub,sup';
+  const INTERACTIVE_REGION = `${ATOMIC_CONTROL},${NAVIGATION},[role="menu"],[role="menubar"],[role="toolbar"],[role="tablist"]`;
   const STRUCTURAL_PARENT = 'table,thead,tbody,tfoot,tr,colgroup,ul,ol,menu,dl,select,optgroup,picture,details';
   const records = new Map();
   const recordsByElement = new Map();
@@ -434,7 +438,7 @@
     if (!/\p{L}/u.test(text) || /^@\S+$/.test(text) || /^(https?:\/\/|www\.)\S+$/i.test(text)) return false;
     if (element.closest('a')?.getAttribute('href')?.startsWith('#')) return false;
     if (/^[\w.+-]+@[\w.-]+\.[a-z]+$/i.test(text)) return false;
-    if (!element.matches('h1,h2,h3,h4,h5,h6') && (text.match(/\p{L}/gu) || []).length < 3) return false;
+    if (!element.matches(HEADINGS) && (text.match(/\p{L}/gu) || []).length < 3) return false;
     return !isTargetScript(text, element);
   }
 
@@ -553,20 +557,39 @@
     return anchor;
   }
 
-  function layoutTranslation(anchor, output, record, styleOf) {
+  function canInsertAfter(anchor, styleOf) {
     const parent = anchor.parentElement;
     if (!parent || parent.closest('select,datalist') || parent.matches(STRUCTURAL_PARENT)) return false;
     let container = parent;
     while (container && styleOf(container).display === 'contents') container = container.parentElement;
     // An inline span still becomes a layout item at this boundary.
-    if (!container || container.matches(STRUCTURAL_PARENT) ||
-      /flex|grid|table-(?:row|header|footer|column)/.test(styleOf(container).display)) return false;
-    const sourceStyle = styleOf(record.element);
-    const short = !record.text.includes('\n') && record.text.length <= 24 &&
-      record.text.split(/\s+/u).length <= 4;
-    const inline = record.element.matches(FORCE_INLINE_TRANSLATION) ||
-      (short && sourceStyle.display !== 'contents') || isInline(record.element, sourceStyle);
-    const flow = styleOf(parent);
+    return Boolean(container && !container.matches(STRUCTURAL_PARENT) &&
+      !/flex|grid|table-(?:row|header|footer|column)/.test(styleOf(container).display));
+  }
+
+  function findInsertionAnchor(record, groups, styleOf) {
+    const anchor = translationAnchor(record);
+    if (!anchor.isConnected) return null;
+    if (canInsertAfter(anchor, styleOf)) return anchor;
+
+    const { element, key } = record;
+    // Move a single complete text group past its own layout boundary.
+    if (element.matches(`${HEADINGS},p`) && element.contains(anchor) &&
+      !element.closest(INTERACTIVE_REGION) &&
+      [...groups].every(([groupKey, group]) => groupKey === key || !group.text) &&
+      canInsertAfter(element, styleOf)) return element;
+    return null;
+  }
+
+  function styleTranslation(anchor, output, record, styleOf) {
+    const { element, text } = record;
+    const sourceStyle = styleOf(element);
+    const outside = anchor === element && element.matches(`${HEADINGS},p`);
+    const flow = styleOf(anchor.parentElement);
+    const short = !text.includes('\n') && text.length <= 24 && text.split(/\s+/u).length <= 4;
+    const inline = !outside && (isInline(anchor.parentElement, flow) ||
+      (!element.matches(HEADINGS) && (element.matches(FORCE_INLINE_TRANSLATION) ||
+        (short && sourceStyle.display !== 'contents') || isInline(element, sourceStyle))));
     Object.assign(output.style, {
       color: 'inherit',
       fontFamily: 'inherit',
@@ -583,9 +606,13 @@
       output.prepend(document.createTextNode('\u00a0\u00a0'));
     } else {
       output.style.display = 'block';
-      output.style.marginBlock = '8px';
+      output.style.marginBlock = '0.5em';
+      if (outside) {
+        const { color, fontFamily, fontSize, fontWeight, lineHeight } = getComputedStyle(record.element);
+        Object.assign(output.style, { color, fontFamily, fontSize, fontWeight,
+          lineHeight: Number.parseFloat(lineHeight) === 0 ? 'normal' : lineHeight });
+      }
     }
-    return true;
   }
 
   function flushRender() {
@@ -606,14 +633,18 @@
       const { key, element } = record;
       if (!key.isConnected || !document.body.contains(element) || records.get(key) !== record || record.output) continue;
       if (!sources.has(element)) sources.set(element, collect(element));
-      if (!matchesSource(record, sources.get(element).get(key))) {
+      const groups = sources.get(element);
+      const source = groups.get(key);
+      if (!matchesSource(record, source)) {
         discard(key);
         dirty.add(element);
         scheduleScan();
         continue;
       }
-      const anchor = translationAnchor(record);
-      if (anchor.isConnected && layoutTranslation(anchor, output, record, styleOf)) ready.push([anchor, output, record]);
+      const anchor = findInsertionAnchor(record, groups, styleOf);
+      if (!anchor) continue;
+      styleTranslation(anchor, output, record, styleOf);
+      ready.push([anchor, output, record]);
     }
     for (const [anchor, output, record] of ready) {
       anchor.after(output);

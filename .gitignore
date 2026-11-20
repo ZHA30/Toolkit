@@ -1,0 +1,9 @@
+# Local reference repositories and worktrees
+/references/
+/worktree/
+
+# Browser test artifacts
+/.playwright-cli/
+
+# macOS metadata
+.DS_Store

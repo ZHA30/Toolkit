@@ -23,7 +23,13 @@
   'use strict';
 
   const MARK = 'data-bilingual';
-  const SKIP = `script,style,noscript,textarea,input,select,button,pre,rt,rp,time,svg,math,canvas,iframe,nav,aside,footer,form,dialog,menu,[role="navigation"],[role="banner"],[role="complementary"],[role="contentinfo"],[role="dialog"],[role="toolbar"],[role="img"],[data-no-translate],[data-notranslate],.sidebar,.breadcrumbs,.breadcrumb,.pagination,.social-share,.sr-only,.visually-hidden,[contenteditable]:not([contenteditable="false"]),[translate="no"],[hidden],[aria-hidden="true"],.notranslate,[${MARK}]`;
+  // Default full-page DOM rules adapted from Read Frog (GPL-3.0).
+  // https://github.com/mengxi-ream/read-frog/tree/main/src/utils/host
+  const SKIP = `head,title,hr,input,textarea,img,video,audio,canvas,source,track,meta,script,noscript,style,link,rt,rp,pre,svg,math,[${MARK}],.sr-only,.visually-hidden,[hidden="until-found" i]`;
+  const FORCE_BLOCK = 'body,h1,h2,h3,h4,h5,h6,br,form,select,button,label,ul,ol,li,blockquote,pre,article,section,figure,figcaption,header,footer,main,nav';
+  const FORCE_INLINE_TRANSLATION = 'a,button,select,option,span';
+  const ATOMIC_CONTROL = 'a,button,summary,[role="link"],[role="button"],[role="menuitem"],[role="tab"],[aria-expanded][aria-controls],code,kbd,ruby,sub,sup';
+  const STRUCTURAL_PARENT = 'table,thead,tbody,tfoot,tr,colgroup,ul,ol,menu,dl,select,optgroup,picture,details';
   const records = new Map();
   const recordsByElement = new Map();
   const PRELOAD = 500;
@@ -270,6 +276,25 @@
     return element.isContentEditable || Boolean(element.closest(SKIP));
   }
 
+  function isInsideClosedDetails(element) {
+    for (let details = element.closest('details:not([open])'); details;
+      details = details.parentElement?.closest('details:not([open])')) {
+      if (details !== element && ![...details.children].find(child => child.tagName === 'SUMMARY')?.contains(element)) return true;
+    }
+    return false;
+  }
+
+  function isOpaque(element) {
+    return element.matches('code,time') ||
+      (element !== document.body && element !== document.documentElement && element.classList.contains('notranslate'));
+  }
+
+  function isInline(element, style) {
+    return !element.matches(FORCE_BLOCK) &&
+      ((style.float === 'left' && Boolean(element.nextSibling?.textContent?.trim())) ||
+        /^(inline|ruby)/.test(style.display) || style.display === 'contents');
+  }
+
   function* textNodes(root) {
     const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT | NodeFilter.SHOW_ELEMENT, {
       acceptNode(node) {
@@ -311,7 +336,10 @@
   }
 
   function* walkGroups(root) {
-    if (!root?.isConnected) return;
+    if (!root?.isConnected || isOpaque(root) || isInsideClosedDetails(root)) return;
+    for (let parent = root.parentElement; parent; parent = parent.parentElement) {
+      if (isOpaque(parent) || !isVisible(parent)) return;
+    }
     function* walk(element) {
       yield;
       const style = getComputedStyle(element);
@@ -340,14 +368,16 @@
           return;
         }
         if (node.nodeType !== Node.ELEMENT_NODE || node.hasAttribute(MARK)) return;
-        if (node.matches('code,kbd,samp,var,math,.katex,.MathJax,.MathJax_Display') && isVisible(node)) {
+        const childStyle = getComputedStyle(node);
+        if (!isVisible(node, childStyle)) return;
+        if (node.matches('math,kbd,samp,var,.katex,.MathJax,.MathJax_Display') && !isExcluded(element)) {
           nodes.push(node);
           const token = `⟦B${protectedNodes.length}⟧`;
           protectedNodes.push({ token, node, value: node.outerHTML });
           parts.push(token);
           return;
         }
-        if (isExcluded(node) || !isVisible(node)) {
+        if (isExcluded(node)) {
           parts.push(' ');
           return;
         }
@@ -356,11 +386,8 @@
           parts.push('\n');
           return;
         }
-        const childStyle = getComputedStyle(node);
-        const dropCap = childStyle.float === 'left' && node.nextSibling;
-        const atomic = node.matches('code,kbd,samp,var,ruby');
-        const isInline = atomic || dropCap || childStyle.display.startsWith('inline') || childStyle.display.startsWith('ruby') || childStyle.display === 'contents';
-        if (!isInline) {
+        const atomic = isOpaque(node) || node.matches('ruby');
+        if (!atomic && !isInline(node, childStyle)) {
           yield* flush();
           yield* walk(node);
         } else if (atomic) {
@@ -375,7 +402,10 @@
         }
       }
       for (const child of element.childNodes) {
-        if (layout && child.nodeType === Node.ELEMENT_NODE && !child.hasAttribute(MARK)) {
+        if (element.matches('details:not([open])') &&
+          (child.nodeType !== Node.ELEMENT_NODE || child.tagName !== 'SUMMARY' ||
+            child !== element.querySelector(':scope > summary'))) continue;
+        if (layout && child.nodeType === Node.ELEMENT_NODE && !child.hasAttribute(MARK) && !isOpaque(child)) {
           yield* flush();
           yield* walk(child);
         }
@@ -449,13 +479,14 @@
 
   function observeGroup(key, group) {
     if (!key.isConnected) return;
-    const { text, element, end, protectedNodes } = group;
+    const { text, element } = group;
     if (!shouldTranslate(text, element)) {
       discard(key);
       return;
     }
     let record = records.get(key);
-    if (!record || record.element !== element || record.text !== text || record.end !== end || record.protectedNodes.some((part, index) => part.node !== protectedNodes[index]?.node || part.value !== protectedNodes[index]?.value) || record.protectedNodes.length !== protectedNodes.length || (record.output && !element.contains(record.output))) {
+    if (!record || !matchesSource(record, group) ||
+      (record.output && (!record.output.isConnected || record.output.previousSibling !== record.anchor))) {
       discard(key);
       record = { ...group, key, pending: false, output: null, retries: 0 };
       records.set(key, record);
@@ -472,7 +503,7 @@
   function isVisible(element, style = getComputedStyle(element)) {
     const font = style.fontFamily.split(',')[0].replace(/["']/g, '').trim().toLowerCase();
     if (/^(material icons|material symbols|google symbols|font awesome|fontawesome)(\s|$)/.test(font)) return false;
-    return style.visibility === 'visible' && style.display !== 'none' && (element.getClientRects().length > 0 || style.display === 'contents');
+    return style.visibility !== 'hidden' && style.display !== 'none';
   }
 
   function matchesSource(record, current) {
@@ -501,11 +532,16 @@
       } else if (part === '\n') output.append(document.createElement('br'));
       else output.append(document.createTextNode(part));
     }
+    renderQueue.push([output, record]);
+    if (renderTimer === undefined) renderTimer = requestAnimationFrame(flushRender);
+  }
+
+  function translationAnchor(record) {
     let anchor = record.end;
     while (anchor.parentElement && anchor.parentElement !== record.element &&
       anchor.parentElement.lastChild === anchor) anchor = anchor.parentElement;
     for (let parent = anchor.parentElement; parent; parent = parent.parentElement) {
-      if (parent.matches('a,button,[role="link"],[role="button"],code,kbd,ruby,sub,sup')) anchor = parent;
+      if (parent.matches(ATOMIC_CONTROL)) anchor = parent;
     }
     while (anchor.nextSibling) {
       const next = anchor.nextSibling;
@@ -514,34 +550,27 @@
         anchor = next;
       } else break;
     }
-    renderQueue.push([anchor, output, record, text]);
-    if (renderTimer === undefined) renderTimer = requestAnimationFrame(flushRender);
+    return anchor;
   }
 
-  function layoutTranslation(anchor, output, record, text, styleOf) {
+  function layoutTranslation(anchor, output, record, styleOf) {
     const parent = anchor.parentElement;
-    if (!parent) return false;
+    if (!parent || parent.closest('select,datalist') || parent.matches(STRUCTURAL_PARENT)) return false;
     let container = parent;
     while (container && styleOf(container).display === 'contents') container = container.parentElement;
-    if (!container || /flex|grid/.test(styleOf(container).display)) return false;
-    for (let element = parent; element && element !== document.body; element = element.parentElement) {
-      const style = styleOf(element);
-      if (Number.parseInt(style.webkitLineClamp, 10) > 0) return false;
-      if (/^(hidden|clip)$/.test(style.overflowY)) {
-        const height = element.computedStyleMap?.().get('height')?.toString();
-        if (style.maxHeight !== 'none' || (height && height !== 'auto')) return false;
-      }
-    }
-
-    const heading = record.element.closest('h1,h2,h3,h4,h5,h6,[role="heading"]');
-    const short = value => !value.includes('\n') && value.trim().length <= 24 && value.trim().split(/\s+/u).length <= 4;
-    const inline = !heading && short(record.text) && short(text);
+    // An inline span still becomes a layout item at this boundary.
+    if (!container || container.matches(STRUCTURAL_PARENT) ||
+      /flex|grid|table-(?:row|header|footer|column)/.test(styleOf(container).display)) return false;
+    const sourceStyle = styleOf(record.element);
+    const short = !record.text.includes('\n') && record.text.length <= 24 &&
+      record.text.split(/\s+/u).length <= 4;
+    const inline = record.element.matches(FORCE_INLINE_TRANSLATION) ||
+      (short && sourceStyle.display !== 'contents') || isInline(record.element, sourceStyle);
     const flow = styleOf(parent);
     Object.assign(output.style, {
       color: 'inherit',
       fontFamily: 'inherit',
       fontWeight: 'inherit',
-      fontSize: heading ? '0.9em' : 'inherit',
       lineHeight: Number.parseFloat(flow.lineHeight) === 0 ? 'normal' : 'inherit',
       whiteSpace: 'normal',
       overflowWrap: 'anywhere',
@@ -551,13 +580,10 @@
     });
     if (inline) {
       output.style.display = 'inline';
-      output.prepend(document.createTextNode('\u2002'));
-    } else if (/^(block|flow-root|list-item|table-cell)$/.test(flow.display)) {
-      output.style.display = 'block';
-      output.style.marginBlockStart = parent.closest('td,th') ? '0.2em' : '0.35em';
+      output.prepend(document.createTextNode('\u00a0\u00a0'));
     } else {
-      output.style.display = 'inline';
-      output.prepend(document.createElement('br'));
+      output.style.display = 'block';
+      output.style.marginBlock = '8px';
     }
     return true;
   }
@@ -570,14 +596,13 @@
       if (!styles.has(element)) {
         const style = getComputedStyle(element);
         styles.set(element, {
-          display: style.display, lineHeight: style.lineHeight, webkitLineClamp: style.webkitLineClamp,
-          overflowY: style.overflowY, maxHeight: style.maxHeight,
+          display: style.display, lineHeight: style.lineHeight, float: style.float,
         });
       }
       return styles.get(element);
     };
     const ready = [];
-    for (const [anchor, output, record, text] of renderQueue.splice(0)) {
+    for (const [output, record] of renderQueue.splice(0)) {
       const { key, element } = record;
       if (!key.isConnected || !document.body.contains(element) || records.get(key) !== record || record.output) continue;
       if (!sources.has(element)) sources.set(element, collect(element));
@@ -587,11 +612,13 @@
         scheduleScan();
         continue;
       }
-      if (anchor.isConnected && layoutTranslation(anchor, output, record, text, styleOf)) ready.push([anchor, output, record]);
+      const anchor = translationAnchor(record);
+      if (anchor.isConnected && layoutTranslation(anchor, output, record, styleOf)) ready.push([anchor, output, record]);
     }
     for (const [anchor, output, record] of ready) {
       anchor.after(output);
       record.output = output;
+      record.anchor = anchor;
     }
   }
 
@@ -706,8 +733,7 @@
   function affectedRoot(element) {
     if (!document.body.contains(element)) return null;
     while (element !== document.body) {
-      const display = getComputedStyle(element).display;
-      if (!display.startsWith('inline') && display !== 'contents') break;
+      if (!isOpaque(element) && !isInline(element, getComputedStyle(element))) break;
       element = element.parentElement;
     }
     return element;
@@ -784,7 +810,7 @@
     enabled = true;
     observer.observe(document.body, {
       childList: true, subtree: true, characterData: true, attributes: true,
-      attributeFilter: ['hidden', 'aria-hidden', 'class', 'style', 'lang', 'translate', 'contenteditable', 'data-no-translate', 'data-notranslate'],
+      attributeFilter: ['open', 'hidden', 'class', 'style', 'lang', 'contenteditable'],
     });
     observer.observe(document.head, { childList: true, subtree: true, characterData: true });
     dirty.add(document.body);
